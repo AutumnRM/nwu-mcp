@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -111,7 +112,7 @@ class NWUJwClient:
         self._client.close()
 
     def _persist_cookies(self) -> None:
-        cookies = {k: v for k, v in self._client.cookies.items()}
+        cookies = {c.name: c.value for c in self._client.cookies.jar if c.value is not None}
         if cookies:
             save_cookies(cookies)
 
@@ -177,17 +178,20 @@ class NWUJwClient:
 
         if post_resp.status_code in (301, 302, 303, 307, 308):
             location = post_resp.headers.get("location", "")
-            if "login_slogin" in location:
-                raise LoginError("登录后仍被重定向回登录页，请检查账号或是否触发验证码。")
             target = (
                 location
                 if location.startswith("http")
                 else f"{urlparse(self.base_url).scheme}://{urlparse(self.base_url).netloc}{location}"
             )
-            init_resp = self._client.get(target)
+            init_resp = self._client.get(target, follow_redirects=True)
             init_resp.raise_for_status()
+            if "login_slogin" in str(init_resp.url):
+                err_soup = BeautifulSoup(init_resp.text, "html.parser")
+                tips = err_soup.find(id="tips")
+                tips_text = tips.get_text(" ", strip=True) if tips else ""
+                raise LoginError(tips_text or "登录后仍停留在登录页，请检查账号或是否触发验证码。")
             self._persist_cookies()
-            return {k: v for k, v in self._client.cookies.items()}
+            return {c.name: c.value for c in self._client.cookies.jar if c.value is not None}
 
         err_soup = BeautifulSoup(post_resp.text, "html.parser")
         tips = err_soup.find(id="tips")
@@ -293,6 +297,12 @@ class NWUJwClient:
             return "", ""
         if not resolved_xnm or (not resolved_xqm and not allow_empty):
             def_xnm, def_xqm = self._detect_current_term(page_path)
+            if (not def_xnm or not def_xqm) and "xskbcx" not in page_path:
+                kb_xnm, kb_xqm = self._detect_current_term(
+                    "/kbcx/xskbcx_cxXskbcxIndex.html?gnmkdm=N253508&layout=default"
+                )
+                def_xnm = def_xnm or kb_xnm
+                def_xqm = def_xqm or kb_xqm
             if not resolved_xnm and not allow_empty:
                 resolved_xnm = def_xnm
             if not resolved_xqm and not allow_empty:
@@ -431,7 +441,8 @@ class NWUJwClient:
 
         if not weeks or not weekdays or not periods:
             meta = self.get_classroom_meta(xqh_id=xqh_id, xnm=use_xnm, xqm=use_xqm)
-            dqzcxq = meta.get("qtlb", {}).get("dqzcxq", {})
+            qtlb = meta.get("qtlb")
+            dqzcxq = qtlb.get("dqzcxq", {}) if isinstance(qtlb, dict) else {}
             if not weeks:
                 cur_week = int(dqzcxq.get("DQZC") or 1)
                 weeks = [cur_week]
@@ -570,24 +581,47 @@ class NWUJwClient:
                 if txt not in summary_lines:
                     summary_lines.append(txt)
 
-        # Extract credit requirement tree nodes containing xfyqjd_id
+        # Extract credit requirement tree nodes containing xfyqjd_id (inline JS or DOM)
         nodes: list[dict[str, str]] = []
         seen_nodes: set[str] = set()
-        for el in soup.select("[xfyqjd_id], [data-xfyqjd_id]"):
-            node_id = str(el.get("xfyqjd_id") or el.get("data-xfyqjd_id") or "").strip()
-            if not node_id or node_id in seen_nodes:
+        js_pattern = re.compile(
+            r"xfyqjd_id='([A-Za-z0-9_]+)'[^>\n]*?leaf='([^']*)'[^>\n]*?>"
+            r"\s*<p[^>]*?yxxf='([^']*)'[^>]*?yqzdxf='([^']*)'[^>]*?sftg='([^']*)'[^>]*>"
+            r"\s*\"([^\"]+)",
+            re.S,
+        )
+        for m in js_pattern.finditer(resp.text):
+            node_id, leaf, yxxf, yqzdxf, sftg, raw_label = m.groups()
+            if node_id in seen_nodes:
                 continue
             seen_nodes.add(node_id)
-            label = el.get_text(" ", strip=True)
+            label = raw_label.replace("&nbsp;", " ").strip()
+            if leaf:
+                label = f"{label} [leaf={leaf}]"
             nodes.append(
                 {
                     "xfyqjd_id": node_id,
-                    "yqzdxf": str(el.get("yqzdxf") or ""),
-                    "yxxf": str(el.get("yxxf") or ""),
-                    "sftg": str(el.get("sftg") or ""),
+                    "yqzdxf": yqzdxf,
+                    "yxxf": yxxf,
+                    "sftg": "是" if sftg == "1" else "否" if sftg == "0" else sftg,
                     "label": label[:120],
                 }
             )
+        if not nodes:
+            for el in soup.select("[xfyqjd_id], [data-xfyqjd_id]"):
+                node_id = str(el.get("xfyqjd_id") or el.get("data-xfyqjd_id") or "").strip()
+                if not node_id or node_id in seen_nodes:
+                    continue
+                seen_nodes.add(node_id)
+                nodes.append(
+                    {
+                        "xfyqjd_id": node_id,
+                        "yqzdxf": str(el.get("yqzdxf") or ""),
+                        "yxxf": str(el.get("yxxf") or ""),
+                        "sftg": str(el.get("sftg") or ""),
+                        "label": el.get_text(" ", strip=True)[:120],
+                    }
+                )
 
         courses: list[dict[str, Any]] = []
         if xfyqjd_id:
